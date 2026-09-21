@@ -1,9 +1,12 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module is intentionally the only place that knows about backend-specific
+connection setup and the writer transaction used to serialize claims. SQLite
+has no ``FOR UPDATE SKIP LOCKED``, so it uses a whole-database ``BEGIN
+IMMEDIATE`` writer reservation instead; PostgreSQL uses an ordinary
+transaction and relies on the explicit per-row ``FOR UPDATE`` locks taken in
+:mod:`storage`. The rest of the application talks to the models through
+:mod:`storage` and never needs to know which backend is active.
 """
 
 from __future__ import annotations
@@ -134,6 +137,10 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+def _is_postgres(url: str) -> bool:
+    return url.startswith("postgresql")
+
+
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
 if _is_sqlite(DATABASE_URL):
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
@@ -177,14 +184,21 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Open the writer transaction used by claims, heartbeats, terminal
+    submissions, and recovery.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    SQLite has no ``FOR UPDATE SKIP LOCKED``, so a ``BEGIN IMMEDIATE`` writer
+    reservation serializes these operations across the whole database,
+    giving each task one active lease. PostgreSQL supports real row locking,
+    so there this is an ordinary transaction; :mod:`storage` takes explicit
+    ``FOR UPDATE`` / ``FOR UPDATE SKIP LOCKED`` locks on the specific rows
+    each operation touches instead of relying on a database-wide lock.
     """
+
+    if not _is_sqlite(DATABASE_URL):
+        with db_session() as session:
+            yield session
+        return
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
@@ -210,11 +224,15 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
             select(Attempt)
             .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
             .order_by(Attempt.lease_expires_at, Attempt.id)
+            .with_for_update(skip_locked=True)
         )
     )
     count = 0
     for attempt in expired:
-        task = db.get(Task, attempt.task_id)
+        # skip_locked: a task currently being claimed, heartbeated, or
+        # completed elsewhere is left for the next recovery pass rather than
+        # blocking on its lock.
+        task = db.get(Task, attempt.task_id, with_for_update={"skip_locked": True})
         if task is None or attempt.outcome != "processing":
             continue
         attempt.outcome = "expired"
