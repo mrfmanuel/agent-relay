@@ -9,11 +9,16 @@ not from a Python lock.
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 # Default to a scratch DB so `pytest` never resets the dev server's
 # `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
-# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests. Use the
+# platform temp dir rather than a hardcoded `/tmp`, which doesn't exist on
+# Windows.
+_scratch_db = Path(tempfile.gettempdir()) / "agent-relay-test.db"
+os.environ.setdefault("RELAY_DATABASE_URL", f"sqlite:///{_scratch_db.as_posix()}")
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -29,7 +34,7 @@ from storage import claim_one
 @pytest.fixture(autouse=True)
 def empty_database():
     # Resets whatever DB RELAY_DATABASE_URL points at. Defaults to the
-    # scratch /tmp file above; never run against a DB with data you need.
+    # scratch file above; never run against a DB with data you need.
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield
