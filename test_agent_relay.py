@@ -157,6 +157,51 @@ def test_expiry_requeues_and_old_token_is_stale_before_recovery():
         assert second.json()["claim_token"] != first["claim_token"]
 
 
+def test_acceptance_scenario_1_register_send_claim_complete_and_read_result():
+    """SPEC.md acceptance scenario 1: register two agents, one sends a task,
+    the other claims and completes it, and the sender reads the result."""
+
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "alice-reviewer")
+        recipient, recipient_headers = register(client, "bob-uppercaser")
+
+        sent = client.post(
+            "/api/v1/tasks",
+            headers=sender_headers,
+            json={"to": recipient["agent_id"], "input": "Review this Python function: def add(a, b): return a + b"},
+        )
+        assert sent.status_code == 201
+        task_id = sent.json()["task_id"]
+        assert sent.json()["status"] == "queued"
+
+        claim = client.post(
+            "/api/v1/tasks/claim",
+            headers=recipient_headers,
+            json={"worker_id": "bob-laptop-1", "wait_seconds": 0},
+        )
+        assert claim.status_code == 200
+        claim_data = claim.json()
+        assert claim_data["task_id"] == task_id
+        assert claim_data["from"] == sender["agent_id"]
+
+        complete = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=recipient_headers,
+            json={"claim_token": claim_data["claim_token"], "output": "Looks correct. No off-by-one or type issues."},
+        )
+        assert complete.status_code == 200
+        assert complete.json()["status"] == "completed"
+
+        result = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+        assert result.status_code == 200
+        result_data = result.json()
+        assert result_data["status"] == "completed"
+        assert result_data["output"] == "Looks correct. No off-by-one or type issues."
+        assert result_data["error"] is None
+        assert result_data["from"] == sender["agent_id"]
+        assert result_data["to"] == recipient["agent_id"]
+
+
 def test_dashboard_is_asset_and_invalid_input_is_documented_error():
     with TestClient(main.app) as client:
         page = client.get("/")
