@@ -1,0 +1,88 @@
+name: CI
+
+# The deploy job targets a local `kind` cluster named "agent-relay" and is
+# meant to be run locally with `act` (https://nektosact.com/) against a kind
+# cluster and Docker daemon already running on the machine act runs on -
+# see README.md for setup. On GitHub-hosted runners the test job runs fine,
+# but the deploy job will fail since no such cluster exists there.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: agent-relay
+  KIND_CLUSTER: agent-relay
+  KUBECTL_VERSION: v1.34.1
+  KIND_VERSION: v0.33.0
+
+jobs:
+  test:
+    name: Test against PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agent_relay
+          POSTGRES_PASSWORD: agent_relay
+          POSTGRES_DB: agent_relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_relay -d agent_relay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Runs the same suite the SQLite starter ships with - including the
+      # register/send/claim/complete/read-back acceptance test - against a
+      # real PostgreSQL instance instead of the SQLite default.
+      RELAY_DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@localhost:5432/agent_relay
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run test suite against PostgreSQL
+        run: uv run pytest -q -v
+
+  build-and-deploy:
+    name: Build image and deploy to kind
+    needs: test # only runs if the PostgreSQL test job above succeeded
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag from git SHA
+        id: vars
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: docker build -t "$IMAGE_NAME:${{ steps.vars.outputs.tag }}" .
+
+      - name: Install kubectl and kind
+        run: |
+          curl -sLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          curl -sLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x /usr/local/bin/kind
+
+      - name: Point kubectl at the local kind cluster
+        run: kind export kubeconfig --name "$KIND_CLUSTER"
+
+      - name: Load image into kind
+        run: kind load docker-image "$IMAGE_NAME:${{ steps.vars.outputs.tag }}" --name "$KIND_CLUSTER"
+
+      - name: Deploy
+        run: |
+          kubectl apply -f k8s/
+          kubectl -n agent-relay set image deployment/agent-relay "agent-relay=$IMAGE_NAME:${{ steps.vars.outputs.tag }}"
+
+      - name: Wait for rollout
+        run: kubectl -n agent-relay rollout status deployment/agent-relay --timeout=180s
